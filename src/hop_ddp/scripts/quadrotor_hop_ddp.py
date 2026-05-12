@@ -203,7 +203,7 @@ def test_trajectory_tracking_ddp():
     l_func, phi_func = make_quadrotor_cost_functions(dynamics, Q, R, Q_T, config.x_target)
 
     def iteration_visualizer(iteration, x_traj_iter, u_traj_iter, T_star_iter, cost_iter, accepted_step):
-        """迭代回调：将缩放状态反变换回物理单位再可视化"""
+        """迭代回调"""
         if visualize_quadrotor_results is None:
             return
         x_vis = jnp.asarray(x_traj_iter[:T_star_iter + 1])
@@ -278,49 +278,6 @@ def test_trajectory_tracking_ddp():
         print(f"最终轨迹图已保存至: {trajectory_path}")
         print(f"跟踪误差图已保存至: {error_path}")
         
-    # # 显示结果
-    # print(f"\nHOP-DDP求解完成:")
-    # print(f"最优时域: {result.T_star}")
-    # print(f"总代价: {cost:.6f}")
-    # print(f"最优控制轨迹形状: {u_opt.shape}")
-    # print(f"最优状态轨迹形状: {x_opt.shape}")
-    
-    # # 计算跟踪误差：只比较最终落点和目标点的距离
-    # # x_opt 的最后一个状态是最终落点
-    # final_state = x_opt[-1]
-    # tracking_error = jnp.linalg.norm(final_state - config.x_target)
-    # print(f"\n最终落点误差: {tracking_error:.6f}")
-    
-    # # 显示所有时间步的结果（按照时间步0:state,input的格式）
-    # print(f"\n所有时间步的状态和控制输入:")
-    # for i in range(5,-1,-1):
-    #     # 状态向量：位置(3), 速度(3), 欧拉角(3), 角速度(3)
-    #     state_str = f"pos=[{x_opt[i][0]:.4f},{x_opt[i][1]:.4f},{x_opt[i][2]:.4f}], "
-    #     state_str += f"vel=[{x_opt[i][3]:.4f},{x_opt[i][4]:.4f},{x_opt[i][5]:.4f}], "
-    #     state_str += f"att=[{x_opt[i][6]:.4f},{x_opt[i][7]:.4f},{x_opt[i][8]:.4f}], "
-    #     state_str += f"omega=[{x_opt[i][9]:.4f},{x_opt[i][10]:.4f},{x_opt[i][11]:.4f}]"
-        
-    #     # 控制输入：四个电机的推力
-    #     control_str = f"f1={u_opt[i][0]:.4f},f2={u_opt[i][1]:.4f},f3={u_opt[i][2]:.4f},f4={u_opt[i][3]:.4f}"
-        
-    #     print(f"时间步 {i}: state=[{state_str}], input=[{control_str}]")
-    
-    # # 打印最终状态
-    # final_state_str = f"pos=[{x_opt[-1][0]:.4f},{x_opt[-1][1]:.4f},{x_opt[-1][2]:.4f}], "
-    # final_state_str += f"vel=[{x_opt[-1][3]:.4f},{x_opt[-1][4]:.4f},{x_opt[-1][5]:.4f}], "
-    # final_state_str += f"att=[{x_opt[-1][6]:.4f},{x_opt[-1][7]:.4f},{x_opt[-1][8]:.4f}], "
-    # final_state_str += f"omega=[{x_opt[-1][9]:.4f},{x_opt[-1][10]:.4f},{x_opt[-1][11]:.4f}]"
-    
-    # print(f"\n最终状态: [{final_state_str}]")
-    
-    # # 目标状态
-    # target_state_str = f"pos=[{config.x_target[0]:.4f},{config.x_target[1]:.4f},{config.x_target[2]:.4f}], "
-    # target_state_str += f"vel=[{config.x_target[3]:.4f},{config.x_target[4]:.4f},{config.x_target[5]:.4f}], "
-    # target_state_str += f"att=[{config.x_target[6]:.4f},{config.x_target[7]:.4f},{config.x_target[8]:.4f}], "
-    # target_state_str += f"omega=[{config.x_target[9]:.4f},{config.x_target[10]:.4f},{config.x_target[11]:.4f}]"
-    
-    # print(f"目标状态: [{target_state_str}]")
-
 def main():
     """主测试函数"""
     run_dir = Path(get_run_dir())

@@ -33,10 +33,6 @@ _logger = get_logger('hop')
 import numpy as np
 
 
-def _wrap_degrees_np(angle_err: np.ndarray) -> np.ndarray:
-    return (angle_err + 180.0) % 360.0 - 180.0
-
-
 @dataclass
 class DDPResult:
     """DDP 求解结果容器"""
@@ -184,277 +180,7 @@ class HOPDDPSolver:
         self.warm_start_iters = ddp.warm_start_fixed_horizon_iters
         self.enable_tstar_jump_clip = ddp.enable_tstar_jump_clip
         self.max_tstar_jump = ddp.max_tstar_jump
-        self.hop_lqr.apply_diagnostics(config.Diagnostics)
-
-    def _diagnose_matrix_batch(self, name: str, mats: jnp.ndarray, symmetric: bool = False) -> bool:
-        """
-        诊断一组矩阵的数值质量。
-        返回:
-            has_nonfinite: 是否存在 NaN/Inf
-        """
-        mats_np = np.asarray(mats)
-        has_nonfinite = not np.isfinite(mats_np).all()
-
-        max_abs = float(np.nanmax(np.abs(mats_np)))
-        _logger.info(f"[diag] {name}: shape={mats_np.shape}, max|x|={max_abs:.3e}, nonfinite={has_nonfinite}")
-
-        if has_nonfinite:
-            bad_idx = np.argwhere(~np.isfinite(mats_np))
-            if bad_idx.size > 0:
-                first_bad = tuple(int(v) for v in bad_idx[0])
-                _logger.info(f"[diag] {name}: first nonfinite index={first_bad}, value={mats_np[first_bad]}")
-            return True
-
-        # 条件数统计（按时间步）
-        if mats_np.ndim == 3 and mats_np.shape[-1] == mats_np.shape[-2]:
-            cond_list = []
-            for k in range(mats_np.shape[0]):
-                try:
-                    cond_k = float(np.linalg.cond(mats_np[k]))
-                except Exception:
-                    cond_k = np.inf
-                cond_list.append(cond_k)
-            cond_arr = np.asarray(cond_list)
-            worst_k = int(np.argmax(cond_arr))
-            _logger.info(f"[diag] {name}: worst cond={cond_arr[worst_k]:.3e} at k={worst_k}")
-            if cond_arr[worst_k] > self.matrix_cond_warn:
-                _logger.info(f"[diag] {name}: WARNING ill-conditioned (>{self.matrix_cond_warn:.1e})")
-
-            if symmetric:
-                min_eigs = []
-                for k in range(mats_np.shape[0]):
-                    M = 0.5 * (mats_np[k] + mats_np[k].T)
-                    try:
-                        min_eigs.append(float(np.min(np.linalg.eigvalsh(M))))
-                    except Exception:
-                        min_eigs.append(np.nan)
-                min_eigs = np.asarray(min_eigs)
-                worst_eig_k = int(np.nanargmin(min_eigs))
-                _logger.info(f"[diag] {name}: min eig={min_eigs[worst_eig_k]:.3e} at k={worst_eig_k}")
-
-        elif mats_np.ndim == 2 and mats_np.shape[-1] == mats_np.shape[-2]:
-            try:
-                cond_v = float(np.linalg.cond(mats_np))
-            except Exception:
-                cond_v = np.inf
-            _logger.info(f"[diag] {name}: cond={cond_v:.3e}")
-            if symmetric:
-                M = 0.5 * (mats_np + mats_np.T)
-                try:
-                    min_eig = float(np.min(np.linalg.eigvalsh(M)))
-                except Exception:
-                    min_eig = np.nan
-                _logger.info(f"[diag] {name}: min eig={min_eig:.3e}")
-
-        return False
-
-    def _diagnose_augmented_inputs(
-        self,
-        iteration: int,
-        A_aug: jnp.ndarray,
-        B_aug: jnp.ndarray,
-        Q_aug: jnp.ndarray,
-        R: jnp.ndarray,
-        Q_T_aug: jnp.ndarray,
-    ) -> bool:
-        """
-        诊断进入 HOP-LQR 的增广矩阵质量，返回是否有 non-finite。
-        """
-        _logger.info(f"[diag] Iteration {iteration}: checking augmented inputs before HOP-LQR")
-        bad = False
-        bad = self._diagnose_matrix_batch("A_aug", A_aug, symmetric=False) or bad
-        bad = self._diagnose_matrix_batch("B_aug", B_aug, symmetric=False) or bad
-        bad = self._diagnose_matrix_batch("Q_aug", Q_aug, symmetric=True) or bad
-        bad = self._diagnose_matrix_batch("R", R, symmetric=True) or bad
-        bad = self._diagnose_matrix_batch("Q_T_aug", Q_T_aug, symmetric=True) or bad
-        return bad
-
-    def _trajectory_quality_metrics(
-        self,
-        x_traj: jnp.ndarray,
-        u_traj: jnp.ndarray,
-        T: int,
-    ) -> dict:
-        """
-        汇总轨迹质量指标，帮助判断固定时域时解是否“真的更好”。
-        这里只做打印诊断，不参与优化。
-        """
-        T = int(T)
-        x_eval = np.asarray(x_traj[:T+1])
-        u_eval = np.asarray(u_traj[:T])
-        x_final = x_eval[-1]
-
-        metrics = {
-            "nonfinite_state": not np.isfinite(x_eval).all(),
-            "nonfinite_control": not np.isfinite(u_eval).all(),
-            "max_abs_state": float(np.nanmax(np.abs(x_eval))),
-            "max_abs_control": float(np.nanmax(np.abs(u_eval))) if u_eval.size else 0.0,
-            "sat_ratio": 0.0,
-            "ctrl_margin_min": np.nan,
-        }
-
-        if self.x_target is not None:
-            x_target = np.asarray(self.x_target)
-            final_err = x_final - x_target
-            if self.n >= 9:
-                final_err[6:9] = _wrap_degrees_np(final_err[6:9])
-            metrics["final_state_err"] = float(np.linalg.norm(final_err))
-            if self.n >= 3:
-                metrics["final_pos_err"] = float(np.linalg.norm(final_err[:3]))
-            if self.n >= 6:
-                metrics["final_vel_err"] = float(np.linalg.norm(final_err[3:6]))
-            if self.n >= 9:
-                metrics["final_att_err"] = float(np.linalg.norm(final_err[6:9]))
-            if self.n >= 12:
-                metrics["final_omega_err"] = float(np.linalg.norm(final_err[9:12]))
-        else:
-            metrics["final_state_err"] = float(np.linalg.norm(x_final))
-
-        if u_eval.size:
-            u_min = np.asarray(self.u_min)
-            u_max = np.asarray(self.u_max)
-            tol = 1e-3 * np.maximum(1.0, u_max - u_min)
-            near_lower = np.abs(u_eval - u_min) <= tol
-            near_upper = np.abs(u_eval - u_max) <= tol
-            saturated = np.logical_or(near_lower, near_upper)
-            metrics["sat_ratio"] = float(np.mean(saturated))
-            ctrl_margin = np.minimum(u_eval - u_min, u_max - u_eval)
-            metrics["ctrl_margin_min"] = float(np.nanmin(ctrl_margin))
-
-        return metrics
-
-    def _print_quality_metrics(self, tag: str, metrics: dict) -> None:
-        pieces = [
-            f"state_err={metrics['final_state_err']:.4f}",
-            f"max|x|={metrics['max_abs_state']:.3e}",
-            f"max|u|={metrics['max_abs_control']:.3e}",
-            f"sat={100.0 * metrics['sat_ratio']:.1f}%",
-        ]
-        if "final_pos_err" in metrics:
-            pieces.insert(0, f"pos_err={metrics['final_pos_err']:.4f}")
-        if "final_vel_err" in metrics:
-            pieces.append(f"vel_err={metrics['final_vel_err']:.4f}")
-        if "final_att_err" in metrics:
-            pieces.append(f"att_err={metrics['final_att_err']:.4f}")
-        if "final_omega_err" in metrics:
-            pieces.append(f"omega_err={metrics['final_omega_err']:.4f}")
-        if np.isfinite(metrics["ctrl_margin_min"]):
-            pieces.append(f"u_margin_min={metrics['ctrl_margin_min']:.3e}")
-        if metrics["nonfinite_state"] or metrics["nonfinite_control"]:
-            pieces.append(
-                f"nonfinite(x={metrics['nonfinite_state']}, u={metrics['nonfinite_control']})"
-            )
-        _logger.info(f"  {tag}: " + ", ".join(pieces))
-
-    def _build_predicted_vs_rollout_horizons(
-        self,
-        selected_T: int,
-        reference_T: int,
-        T_min: int,
-        T_max: int,
-    ) -> list[int]:
-        """
-        Build a small, high-signal horizon set for predicted-vs-rollout checks.
-        """
-        candidates: list[int] = []
-
-        def add_horizon(t_val: int) -> None:
-            t_int = int(max(T_min, min(T_max, t_val)))
-            if t_int not in candidates:
-                candidates.append(t_int)
-
-        add_horizon(selected_T)
-        add_horizon(reference_T)
-        add_horizon(T_max)
-
-        step = max(1, int(self.predicted_vs_rollout_neighbor_step))
-        add_horizon(selected_T - step)
-        add_horizon(selected_T + step)
-
-        selection_costs = getattr(self.hop_lqr, "last_selection_costs", None)
-        if selection_costs is not None:
-            costs_np = np.asarray(selection_costs)
-            finite_idx = np.flatnonzero(np.isfinite(costs_np))
-            if finite_idx.size > 0:
-                order = finite_idx[np.argsort(costs_np[finite_idx])]
-                for idx in order[: max(1, int(self.predicted_vs_rollout_top_k))]:
-                    add_horizon(int(idx) + 1)
-
-        return candidates
-
-    def _print_predicted_vs_rollout_diagnostics(
-        self,
-        x0: jnp.ndarray,
-        x_traj: jnp.ndarray,
-        u_traj: jnp.ndarray,
-        selected_T: int,
-        reference_T: int,
-        T_min: int,
-        T_max: int,
-    ) -> None:
-        """
-        Compare HOP-LQR predicted costs against real DDP rollout results.
-
-        This is purely diagnostic: it does not affect horizon selection.
-        """
-        if not self.enable_predicted_vs_rollout_diagnostics:
-            return
-
-        candidates = self._build_predicted_vs_rollout_horizons(
-            selected_T=selected_T,
-            reference_T=reference_T,
-            T_min=T_min,
-            T_max=T_max,
-        )
-        if not candidates:
-            return
-
-        predicted_raw = getattr(self.hop_lqr, "last_J_values", None)
-        predicted_safe = getattr(self.hop_lqr, "last_selection_costs", None)
-        predicted_raw_np = None if predicted_raw is None else np.asarray(predicted_raw)
-        predicted_safe_np = None if predicted_safe is None else np.asarray(predicted_safe)
-
-        lines = []
-        best_rollout_cost = None
-        best_rollout_T = None
-        for cand_T in candidates:
-            K_cand, k_cand, _, _ = self._ddp_backward_pass(x_traj, u_traj, cand_T)
-            current_cand_cost = self._compute_trajectory_cost(x_traj, u_traj, cand_T)
-            x_new, u_new, rollout_cost = self._linesearch(
-                x0, x_traj, u_traj, K_cand, k_cand, cand_T, current_cand_cost
-            )
-            metrics_new = self._trajectory_quality_metrics(x_new, u_new, cand_T)
-            rollout_cost_f = float(rollout_cost)
-            pred_raw = (
-                float(predicted_raw_np[cand_T - 1])
-                if predicted_raw_np is not None and cand_T - 1 < predicted_raw_np.shape[0]
-                else np.nan
-            )
-            pred_safe = (
-                float(predicted_safe_np[cand_T - 1])
-                if predicted_safe_np is not None and cand_T - 1 < predicted_safe_np.shape[0]
-                else np.nan
-            )
-            lines.append(
-                f"T={cand_T}:"
-                f" predJ={pred_raw:.6f},"
-                f" selectJ={pred_safe:.6f},"
-                f" rolloutCost={rollout_cost_f:.6f},"
-                f" pos={float(metrics_new.get('final_pos_err', np.nan)):.4f},"
-                f" state={float(metrics_new.get('final_state_err', np.nan)):.4f}"
-            )
-            if np.isfinite(rollout_cost_f) and (
-                best_rollout_cost is None or rollout_cost_f < best_rollout_cost
-            ):
-                best_rollout_cost = rollout_cost_f
-                best_rollout_T = cand_T
-
-        _logger.info(
-            "[diag] HOP-LQR predicted-vs-rollout:"
-            f" selected T*={selected_T},"
-            f" best_rollout_T={best_rollout_T};"
-            f" {' | '.join(lines)}"
-        )
+        self.hop_lqr.apply_settings(config.Diagnostics)
 
     @partial(jit, static_argnums=(0,))
     def _compute_augmented_system(self, x_traj: jnp.ndarray, u_traj: jnp.ndarray) -> tuple:
@@ -876,7 +602,6 @@ class HOPDDPSolver:
         # 初始化最优轨迹
         opt_x_traj = x_traj
         opt_u_traj = u_traj
-        best_task_metrics = self._trajectory_quality_metrics(x_traj, u_traj, T_max)
         # 初始化
         iteration = 0
         cost_decrease = float('inf')
@@ -891,15 +616,6 @@ class HOPDDPSolver:
             # === 步骤1: 线性化和增广 ===
             # _logger.info(f"迭代 {iteration+1}: 开始计算增广系统")
             A_aug, B_aug, Q_aug, R, _ = self._compute_augmented_system(x_traj, u_traj)
-            # 检查矩阵的统计信息
-            # _logger.info(f"迭代 {iteration+1}: A_aug - min: {jnp.min(A_aug):.2e}, max: {jnp.max(A_aug):.2e}, NaN: {jnp.any(jnp.isnan(A_aug))}, Inf: {jnp.any(jnp.isinf(A_aug))}")
-            # _logger.info(f"迭代 {iteration+1}: B_aug - min: {jnp.min(B_aug):.2e}, max: {jnp.max(B_aug):.2e}, NaN: {jnp.any(jnp.isnan(B_aug))}, Inf: {jnp.any(jnp.isinf(B_aug))}")
-            # _logger.info(f"迭代 {iteration+1}: Q_aug - min: {jnp.min(Q_aug):.2e}, max: {jnp.max(Q_aug):.2e}, NaN: {jnp.any(jnp.isnan(Q_aug))}, Inf: {jnp.any(jnp.isinf(Q_aug))}")
-            # _logger.info(f"迭代 {iteration+1}: R - min: {jnp.min(R):.2e}, max: {jnp.max(R):.2e}, NaN: {jnp.any(jnp.isnan(R))}, Inf: {jnp.any(jnp.isinf(R))}")
-            # === 步骤2: 时域选择 ===
-            # 计算增广初始状态
-            # 注意：paper 的 HOP-DDP 子问题是在偏差坐标 δx_k = x_k - xbar_k 上构造的，
-            # 因此这里必须传入 δx_0，而不是原始状态 x0。
             delta_x0 = self._state_difference(x0, x_traj[0])
             z0 = jnp.concatenate([delta_x0, jnp.array([1.0])])
             if iteration == 0:
@@ -910,31 +626,14 @@ class HOPDDPSolver:
                 )
             # _logger.info(f"迭代 {iteration+1}: z0 - min: {jnp.min(z0):.2e}, max: {jnp.max(z0):.2e}, NaN: {jnp.any(jnp.isnan(z0))}, Inf: {jnp.any(jnp.isinf(z0))}")
             
-            # 构造 HOP-LQR 的终端代价矩阵。
-            # paper 原版使用共享 Q_T(x_N)，而 DDP 扩展可为每个候选 horizon
-            # 使用各自的 Q_T(x_t) 以减少短 horizon 的 terminal mismatch。
             x_N = x_traj[-1]
-            if self.use_per_horizon_terminal_surrogate:
-                Q_T_aug = vmap(self._compute_terminal_augmented_cost)(x_traj[1 : T_max + 1])
-                if iteration == 0:
-                    _logger.info(
-                        "[diag] terminal surrogate: per-horizon Q_T_aug(x_t), "
-                        f"shape={tuple(Q_T_aug.shape)}"
-                    )
-            else:
-                Q_T_aug = self._compute_terminal_augmented_cost(x_N)
-                if iteration == 0:
-                    _logger.info(
-                        "[diag] terminal surrogate: shared Q_T_aug(x_N), "
-                        f"shape={tuple(Q_T_aug.shape)}"
-                    )
-            # _logger.info(f"迭代 {iteration+1}: Q_T_aug - min: {jnp.min(Q_T_aug):.2e}, max: {jnp.max(Q_T_aug):.2e}, NaN: {jnp.any(jnp.isnan(Q_T_aug))}, Inf: {jnp.any(jnp.isinf(Q_T_aug))}")
-            # has_bad_aug = self._diagnose_augmented_inputs(iteration + 1, A_aug, B_aug, Q_aug, R, Q_T_aug)
-            # if has_bad_aug:
-            #     _logger.info(f"[diag] Iteration {iteration+1}: augmented matrices contain NaN/Inf; this will directly contaminate HOP-LQR J_values.")
+            Q_T_aug = vmap(self._compute_terminal_augmented_cost)(x_traj[1 : T_max + 1])
+            if iteration == 0:
+                _logger.info(
+                    "[diag] terminal surrogate: per-horizon Q_T_aug(x_t), "
+                    f"shape={tuple(Q_T_aug.shape)}"
+                )
             
-            # 先用固定长时域做少量 warm start，避免 HOP-LQR 在静止名义轨迹上
-            # 过早把四旋翼误判成 T=1 最优。
             use_warm_start_horizon = iteration < self.warm_start_iters
             if use_warm_start_horizon:
                 horizon_source = "warm-start"
@@ -948,52 +647,18 @@ class HOPDDPSolver:
                 horizon_source = "hop-lqr"
                 # _logger.info(f"迭代 {iteration+1}: 调用HOP-LQR求解...")
                 # 使用 HOP-LQR 选择最优时域
-                T_star_raw = self.hop_lqr.solve(
+                T_star = self.hop_lqr.solve(
                     z0, A_aug, B_aug, Q_aug, R, Q_T_aug, w, T_min, T_max
                 )
-                # _logger.info(f"迭代 {iteration+1}: HOP-LQR返回 T_star_raw = {T_star_raw}")
-            
-                if T_star_raw == 0:
-                    T_star_raw = self.pre_T_star
-                if self.enable_tstar_jump_clip:
-                    t_lower = max(T_min, self.pre_T_star - self.max_tstar_jump)
-                    t_upper = min(T_max, self.pre_T_star + self.max_tstar_jump)
-                    T_star = int(max(t_lower, min(T_star_raw, t_upper)))
-                    if T_star != T_star_raw:
-                        _logger.info(f"clip T*: raw={T_star_raw} -> used={T_star} (window=[{t_lower}, {t_upper}])")
-                else:
-                    t_lower = T_min
-                    t_upper = T_max
-                    T_star = T_star_raw
-                self._print_predicted_vs_rollout_diagnostics(
-                    x0=x0,
-                    x_traj=x_traj,
-                    u_traj=u_traj,
-                    selected_T=T_star,
-                    reference_T=self.pre_T_star,
-                    T_min=T_min,
-                    T_max=T_max,
-                )
-            # T_star = T_max
-            # _logger.info(f"new T_star: {T_star}")
-            # if abs(T_star - self.pre_T_star) > 50 :
-            #     T_star = self.pre_T_star
-            # else:
-            #     self.pre_T_star = T_star
-            # T_star = T_max
             # === 步骤3: 截断的反向传播 ===
             # _logger.info(f"迭代 {iteration+1}: 开始反向传播，T_star = {T_star}")
             K, k_vec, _, _ = self._ddp_backward_pass(
                 x_traj, u_traj, T_star
             )
-            # _logger.info(f"迭代 {iteration+1}: 反向传播完成 - K shape: {K.shape}, k_vec shape: {k_vec.shape}")
-            # _logger.info(f"迭代 {iteration+1}: K - min: {jnp.min(K):.2e}, max: {jnp.max(K):.2e}, NaN: {jnp.any(jnp.isnan(K))}, Inf: {jnp.any(jnp.isinf(K))}")
-            # _logger.info(f"迭代 {iteration+1}: k_vec - min: {jnp.min(k_vec):.2e}, max: {jnp.max(k_vec):.2e}, NaN: {jnp.any(jnp.isnan(k_vec))}, Inf: {jnp.any(jnp.isinf(k_vec))}")
             # === 步骤4: 前向推演和线搜索 ===
             current_cost = self._compute_trajectory_cost(
                 x_traj, u_traj, T_star
             )
-            current_metrics = self._trajectory_quality_metrics(x_traj, u_traj, T_star)
             # _logger.info(f"迭代 {iteration+1}: 当前成本 = {current_cost:.6f}, NaN: {jnp.isnan(current_cost)}, Inf: {jnp.isinf(current_cost)}")
             # 使用并行线搜索
             # 传全尺寸，避免因 T_star 变化触发 JIT 重新编译
@@ -1003,13 +668,11 @@ class HOPDDPSolver:
             # _logger.info(f"迭代 {iteration+1}: 线搜索完成 - 最优成本 = {best_cost:.6f}, NaN: {jnp.isnan(best_cost)}, Inf: {jnp.isinf(best_cost)}")
             # 检查是否接受新轨迹
             cost_decrease = current_cost - best_cost
-            candidate_metrics = self._trajectory_quality_metrics(best_x_new, best_u_new, T_star)
             accepted_step = (cost_decrease > 0)
             if cost_decrease > 0:
                 # 接受新轨迹
                 # best_x_new / best_u_new 已经是 _forward_pass 算好的全长结果，
                 # 其中 T_star 内为优化步，T_star 外使用参考控制继续 rollout。
-                # 不要再广播最后一个控制填尾巴，否则会污染尾部名义轨迹。
                 x_traj = best_x_new
                 u_traj = best_u_new
                 current_cost = best_cost
@@ -1019,9 +682,6 @@ class HOPDDPSolver:
                 opt_x_traj = x_traj
                 opt_u_traj = u_traj
 
-                accepted_metrics = self._trajectory_quality_metrics(x_traj, u_traj, T_star)
-                if accepted_metrics.get("final_pos_err", np.inf) < best_task_metrics.get("final_pos_err", np.inf):
-                    best_task_metrics = accepted_metrics
 
                 if iteration >= 2:
                     cost_change = abs(iteration_costs[-1] - iteration_costs[-2])
@@ -1040,8 +700,6 @@ class HOPDDPSolver:
             _logger.info(f"Iteration {iteration+1}: T*={T_star}, Cost={current_cost:.6f}, "
                   f"ΔCost={cost_decrease:.6f}, Reg={self.reg:.2e}, Time={iteration_time:.3f}s, "
                   f"Step={step_status}, HorizonSource={horizon_source}")
-            self._print_quality_metrics("current quality", current_metrics)
-            self._print_quality_metrics("candidate quality", candidate_metrics)
             if self.iteration_callback is not None:
                 try:
                     self.iteration_callback(
@@ -1060,8 +718,6 @@ class HOPDDPSolver:
         # iLQR风格的收敛诊断
         final_T = iteration_T_stars[-1] if iteration_T_stars else T_max
         control_cost = iteration_costs[-1] - w * final_T
-        
-        
         result = DDPResult(
             u_opt=opt_u_traj[:final_T],
             x_opt=opt_x_traj[:final_T+1],
@@ -1078,13 +734,5 @@ class HOPDDPSolver:
         _logger.info(f"最终时域: T* = {final_T}")
         _logger.info(f"总成本: {iteration_costs[-1]:.6f} (二次成本: {control_cost:.6f} + 时域惩罚: {w*final_T:.6f})")
         _logger.info(f"收敛: {abs(cost_decrease) < tol and cost_decrease >= 0}")
-        final_metrics = self._trajectory_quality_metrics(opt_x_traj, opt_u_traj, final_T)
-        self._print_quality_metrics("final quality", final_metrics)
-        if "final_pos_err" in best_task_metrics:
-            _logger.info(
-                f"  best task quality: pos_err={best_task_metrics['final_pos_err']:.4f}, "
-                f"state_err={best_task_metrics['final_state_err']:.4f}"
-            )
         _logger.info("="*60)
-        
         return result
