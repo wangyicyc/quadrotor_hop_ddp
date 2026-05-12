@@ -1,0 +1,16 @@
+# Local generated/tutorial/training folders
+public_HOP_horizon_optimal_tutorial/
+tennis_rl_train_copy/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyc
+# Image files
+*.png
+*.log
+
+# Local experiment outputs
+src/contact_hop_plan/data/*
+
+.codex/

@@ -1,0 +1,2 @@
+
+-DCATKIN_DEVEL_PREFIX=/home/cyc/HOP-DDP/devel -DCMAKE_INSTALL_PREFIX=/home/cyc/HOP-DDP/install -G Unix Makefiles
